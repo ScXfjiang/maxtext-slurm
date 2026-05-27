@@ -10,9 +10,13 @@ The Ray actor handles:
   - Streaming logs (subprocess inherits actor's stdout/stderr fds)
   - Collecting the exit code
 
-Stack traces & flame graphs are available via the Ray Dashboard (port 8265).
-py-spy is wrapped to target the training subprocess directly (see
-ray_cluster.sh).
+Stack traces & flame graphs are available via the Ray Dashboard at
+127.0.0.1:8265 on the head node — reach it via the SSH tunnel command
+printed by `print_ray_info()` in `utils/ray_cluster.sh` (it does NOT
+listen on the head's external interfaces; that's intentional, since
+the dashboard's job-submission API is unauthenticated).  py-spy is
+wrapped to target the training subprocess directly (see
+`utils/ray_cluster.sh`).
 """
 
 import os
@@ -47,23 +51,31 @@ class MaxTextTrainerActor:
     def run_training(self, argv: list, env_vars: dict) -> int:
         """Launch training in a subprocess and wait for result.
 
+        In 1-GPU-per-process mode (``ONE_GPU_PER_PROCESS=true``), fans out
+        to ``LOCAL_WORLD_SIZE`` subprocesses per node (one per GPU), each
+        with its own ``LOCAL_RANK`` / ``GLOBAL_RANK`` / ``NPROCS``. Mirrors
+        the fan-out that ``_train.sh`` does in the non-Ray path.
+
         Uses subprocess.Popen with env=env_vars to give the training process
         a clean environment (exactly what _train.sh exported) with no Ray
         thread contamination.  stdout/stderr are inherited from the actor
         worker, so output flows through Ray's log streaming automatically.
         """
-        # Resolve the mfu_tracker.py script path (same entry point as non-Ray mode)
+        # Resolve the monkey_patch_maxtext.py script path (same entry point as non-Ray mode)
         script_dir = env_vars.get(
             "MAXTEXT_SLURM_DIR",
             os.path.dirname(os.path.abspath(__file__)),
         )
-        mfu_script = os.path.join(script_dir, "utils", "mfu_tracker.py")
+        monkey_patch_script = os.path.join(script_dir, "utils", "monkey_patch_maxtext.py")
 
-        cmd = [sys.executable, "-u", mfu_script] + list(argv)
+        cmd = [sys.executable, "-u", monkey_patch_script] + list(argv)
 
         # Ensure PYTHONUNBUFFERED is set for real-time log streaming
         launch_env = dict(env_vars)
         launch_env["PYTHONUNBUFFERED"] = "1"
+
+        if launch_env.get("ONE_GPU_PER_PROCESS", "").lower() == "true":
+            return self._fan_out_one_gpu_per_proc(cmd, launch_env)
 
         print(f"{self.tag} Launching training subprocess: {' '.join(cmd[:3])} ...",
               flush=True)
@@ -94,6 +106,30 @@ class MaxTextTrainerActor:
                   f"{p.returncode}", flush=True)
         return p.returncode
 
+    def _fan_out_one_gpu_per_proc(self, cmd: list, launch_env: dict) -> int:
+        """Launch one subprocess per local GPU; return first non-zero exit code."""
+        local_world_size = int(launch_env["LOCAL_WORLD_SIZE"])
+        nprocs = int(launch_env["NPROCS"])
+        print(f"{self.tag} 1-GPU/proc: launching {local_world_size} "
+              f"subprocesses (nprocs={nprocs})", flush=True)
+
+        procs = []
+        for i in range(local_world_size):
+            penv = dict(launch_env)
+            penv["LOCAL_RANK"] = str(i)
+            penv["GLOBAL_RANK"] = str(self.node_rank * local_world_size + i)
+            p = subprocess.Popen(cmd, env=penv, cwd=launch_env.get("PWD") or None)
+            print(f"{self.tag}   proc {i}/{local_world_size} "
+                  f"pid={p.pid} GLOBAL_RANK={penv['GLOBAL_RANK']}", flush=True)
+            procs.append(p)
+
+        first_nonzero = 0
+        for p in procs:
+            p.wait()
+            if p.returncode != 0 and first_nonzero == 0:
+                first_nonzero = p.returncode
+        return first_nonzero
+
 
 # ---------------------------------------------------------------------------
 # Driver  (one per node — connects to Ray, creates actor, waits)
@@ -109,7 +145,7 @@ def main():
     captured_env = dict(os.environ)
 
     # Ensure MAXTEXT_SLURM_DIR is in the captured env so the actor can
-    # reliably resolve mfu_tracker.py.  (submit.sh exports this on the host,
+    # reliably resolve monkey_patch_maxtext.py.  (submit.sh exports this on the host,
     # but it is not passed as a Docker --env flag.)
     captured_env.setdefault(
         "MAXTEXT_SLURM_DIR",
@@ -138,7 +174,20 @@ def main():
         traceback.print_exc()
         exit_code = 1
     finally:
-        ray.kill(actor, no_restart=True)
+        # Best-effort: the actor may already be self-terminating, the GCS
+        # connection on another rank may have torn down concurrently, the
+        # RPC may have timed out, or the runtime context may be gone.  Any
+        # of those would raise from `ray.kill`, which without the wrapper
+        # would propagate out of `finally`, suppress `sys.exit(exit_code)`,
+        # and cause Python to exit non-zero with a traceback EVEN WHEN
+        # TRAINING SUCCEEDED.  Symptom is asymmetric rank-N exits at job
+        # end (1 of N ranks exits 1, the others 0) for jobs that reached
+        # the final training step cleanly.  Race exposure scales with N,
+        # so the bug shows up most often on multi-node sweeps.
+        try:
+            ray.kill(actor, no_restart=True)
+        except Exception:
+            pass
 
     sys.exit(exit_code)
 

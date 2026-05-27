@@ -3,6 +3,10 @@
 
 _RAY_SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 source "$_RAY_SCRIPT_DIR/utils/job_dir.sh"
+# detect_cluster_ip is required by start_ray_head / start_ray_worker for the
+# `--node-ip-address` private-bind security fix.  Source at the top so the
+# function is in scope regardless of which entry point reaches us.
+source "$_RAY_SCRIPT_DIR/utils/detect_ip.sh"
 
 export RAY_LOG_TO_STDERR=0
 export RAY_BACKEND_LOG_LEVEL=fatal
@@ -21,8 +25,10 @@ export RAY_num_heartbeats_timeout=${RAY_num_heartbeats_timeout:-20}             
 # _container.sh --env).  No default — prevents silent fallback to a
 # potentially occupied port.
 RAY_HEAD_IP="${JAX_COORDINATOR_IP:-localhost}"
-RAY_METRICS_PORT=55080
-PROMETHEUS_PORT=9190
+# Allow the caller to pre-set these via env (e.g., when running multiple jobs
+# on one host or to avoid a port collision); fall back to defaults otherwise.
+RAY_METRICS_PORT="${RAY_METRICS_PORT:-55080}"
+PROMETHEUS_PORT="${PROMETHEUS_PORT:-9190}"
 
 # Persist Ray logs to the shared job output directory so they survive crashes.
 # Inside Docker, this is usually /outputs; in direct-in-container runs it may
@@ -135,13 +141,29 @@ install_ray() {
 }
 
 start_ray_head() {
-    echo "[Ray] Starting HEAD on $(hostname):${RAY_PORT}"
+    # SECURITY (dashboard): bind the dashboard / job-submission HTTP
+    # endpoint to localhost only.  Ray's `JobSubmissionClient` HTTP API is
+    # unauthenticated; binding to 0.0.0.0 on a host with a public IP lets
+    # an internet scanner submit code that runs as root inside the
+    # container.
+    #
+    # SECURITY (GCS): bind the GCS server (RAY_PORT) to the cluster-
+    # private subnet only.  GCS defaults to binding all interfaces
+    # (0.0.0.0); on a public IP, internet scanners can join the cluster as
+    # raylets within seconds of head startup and execute code in the
+    # actor pool.  `--node-ip-address=<private>` restricts the GCS bind to
+    # the private IP only — workers reach the head over the private
+    # subnet, internet scanners cannot connect.
+    local cluster_ip
+    cluster_ip=$(detect_cluster_ip)
+    echo "[Ray] Starting HEAD on $(hostname):${RAY_PORT} (bind=${cluster_ip})"
     if ! ray start --head --port=$RAY_PORT \
         --num-cpus=1 \
-        --dashboard-host=0.0.0.0 --dashboard-port=8265 \
+        --node-ip-address="$cluster_ip" \
+        --dashboard-host=127.0.0.1 --dashboard-port=8265 \
         --metrics-export-port=$RAY_METRICS_PORT \
         --disable-usage-stats 2>&1; then
-        echo "[Ray] HEAD failed to start (port $RAY_PORT, dashboard 8265)" >&2
+        echo "[Ray] HEAD failed to start (port $RAY_PORT, dashboard 8265, bind $cluster_ip)" >&2
         return 1
     fi
     _persist_ray_logs
@@ -152,11 +174,17 @@ start_ray_head() {
 }
 
 start_ray_worker() {
-    echo "[Ray] Starting WORKER -> ${RAY_HEAD_IP}:${RAY_PORT}"
+    # SECURITY: bind the worker raylet to the cluster-private IP (matches
+    # the head's GCS bind in start_ray_head).  Workers must connect to the
+    # head over the private subnet, never the public network.
+    local cluster_ip
+    cluster_ip=$(detect_cluster_ip)
+    echo "[Ray] Starting WORKER -> ${RAY_HEAD_IP}:${RAY_PORT} (bind=${cluster_ip})"
     sleep 5
     for i in {1..18}; do
         ray start --address="${RAY_HEAD_IP}:${RAY_PORT}" \
             --num-cpus=1 \
+            --node-ip-address="$cluster_ip" \
             --no-monitor \
             --metrics-export-port=$RAY_METRICS_PORT \
             --disable-usage-stats &>/dev/null && {
@@ -175,7 +203,7 @@ _install_pyspy_subprocess_wrapper() {
     #
     # The Ray Dashboard calls 'py-spy dump -p <worker_pid>', but the worker is
     # just sitting in p.wait() — the real training runs in a child process
-    # (mfu_tracker.py).  Attaching py-spy to the worker's thread-heavy process
+    # (monkey_patch_maxtext.py).  Attaching py-spy to the worker's thread-heavy process
     # and traversing via --subprocesses is slow and unreliable (frequent 500s).
     #
     # This wrapper finds the worker's child PID and targets it directly, which
@@ -193,13 +221,18 @@ _install_pyspy_subprocess_wrapper() {
 REAL="$(dirname "$0")/$(basename "$0")-real"
 if [[ "$1" == "dump" || "$1" == "record" ]]; then
     # Redirect to child process: the Ray Dashboard targets the Ray worker PID,
-    # but the training code runs in a subprocess (mfu_tracker.py).  Targeting
+    # but the training code runs in a subprocess (monkey_patch_maxtext.py).  Targeting
     # the child directly is faster and far more reliable than traversing the
     # worker's thread-heavy process tree.
+    #
+    # In 1-GPU-per-process mode the actor has multiple children (one per GPU).
+    # Set PYSPY_LOCAL_RANK=N to pick the Nth child (default: 0, i.e. rank 0).
     ARGS=("$@")
+    TARGET_RANK="${PYSPY_LOCAL_RANK:-0}"
     for ((i=0; i<${#ARGS[@]}; i++)); do
         if [[ "${ARGS[$i]}" == "-p" && -n "${ARGS[$((i+1))]}" ]]; then
-            CHILD=$(pgrep -P "${ARGS[$((i+1))]}" 2>/dev/null | head -1)
+            # sed -n "Np" picks the Nth line (1-indexed), so add 1.
+            CHILD=$(pgrep -P "${ARGS[$((i+1))]}" 2>/dev/null | sed -n "$((TARGET_RANK+1))p")
             [[ -n "$CHILD" ]] && ARGS[$((i+1))]="$CHILD"
             break
         fi
@@ -263,7 +296,11 @@ start_tensorboard() {
     # OUTPUT_PATH is exported by _train_with_ray.sh via resolve_output_path().
     local output_dir="${OUTPUT_PATH:?OUTPUT_PATH not set}"
     mkdir -p "$output_dir"
-    tensorboard --logdir="$output_dir" --port=6006 --bind_all &>/dev/null &
+    # SECURITY: bind to localhost (not --bind_all). Tunnel via SSH-J
+    # ProxyJump per print_ray_info().  TB serves logs only — strictly
+    # less dangerous than Ray's job-submission HTTP, but still leaks model /
+    # run names to anyone scanning the cluster's public IPs.
+    tensorboard --logdir="$output_dir" --port=6006 --host=127.0.0.1 &>/dev/null &
     echo "[TensorBoard] Started on port 6006 (logdir: $output_dir)"
 }
 
@@ -277,9 +314,10 @@ print_ray_info() {
     local login_ip="${LOGIN_NODE_IP:-user-unknown@ip-unknown}"
     cat <<EOF
 ==============================================
-SSH tunnel from your local machine (use hostname or IP, whichever works):
-  ssh -L 8265:${host}:8265 -L 6006:${host}:6006 -L ${PROMETHEUS_PORT}:${host}:${PROMETHEUS_PORT} ${login_hostname}
-  ssh -L 8265:${host}:8265 -L 6006:${host}:6006 -L ${PROMETHEUS_PORT}:${host}:${PROMETHEUS_PORT} ${login_ip}
+SSH tunnel from your local machine (Ray dashboard is bound to the head's
+localhost for security; use ProxyJump through the login node):
+  ssh -J ${login_hostname} -L 8265:localhost:8265 -L 6006:localhost:6006 -L ${PROMETHEUS_PORT}:localhost:${PROMETHEUS_PORT} root@${host}
+  ssh -J ${login_ip}       -L 8265:localhost:8265 -L 6006:localhost:6006 -L ${PROMETHEUS_PORT}:localhost:${PROMETHEUS_PORT} root@${host}
 
 Then open in your browser:
   Ray Dashboard:  http://localhost:8265

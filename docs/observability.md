@@ -22,9 +22,11 @@ See [Notifications](notifications.md) for one-time setup, full usage, options, a
 
 ## Real-time monitoring
 
-Three dashboards are accessible via SSH tunnel while the job runs:
+Three dashboards are accessible via SSH tunnel while the job runs. All three bind to **`127.0.0.1` on the job's head node** — they are not reachable on the head's external interfaces. This is intentional: the Ray dashboard's [job-submission HTTP endpoint](https://docs.ray.io/en/latest/cluster/running-applications/job-submission/index.html) is unauthenticated and would let anyone with TCP reach to that port run arbitrary code as root inside the container. The localhost binding closes that surface; legitimate access goes through SSH ProxyJump.
 
-| Dashboard | What it shows | Port |
+> **Inter-node services** (Ray GCS on `RAY_PORT`, JAX coordinator on `JAX_COORDINATOR_PORT`) bind to the cluster-private RFC1918 subnet via `detect_cluster_ip()` in `utils/detect_ip.sh`, not `0.0.0.0`. Workers reach the head over the private subnet only — internet scanners that previously joined open Ray clusters as raylets can no longer connect. The metrics-exporter port (`9400`) remains cross-node-reachable on the private subnet so Prometheus can scrape it. Single-node and no-private-network setups fall back to the public IP automatically.
+
+| Dashboard | What it shows | Port (head's localhost) |
 |-----------|--------------|------|
 | [Ray](https://www.ray.io/) Dashboard | Actor status, live stack traces, flame graphs | 8265 |
 | Prometheus | GPU thermals/power/clocks/VRAM, RAS errors, TCP retransmits, RDMA counters, training scalars (loss, LR, grad norms, throughput) | 9190 (auto-increments if occupied) |
@@ -36,16 +38,20 @@ The job output prints SSH tunnel instructions (both hostname and IP). The Promet
 
 ```
 SSH tunnel (hostname):
-  ssh -L 8265:node001:8265 -L 6006:node001:6006 -L 9190:node001:9190 root@login01
+  ssh -J me@login01 -L 8265:localhost:8265 -L 6006:localhost:6006 -L 9190:localhost:9190 root@node001
 SSH tunnel (IP):
-  ssh -L 8265:node001:8265 -L 6006:node001:6006 -L 9190:node001:9190 root@203.0.113.10
+  ssh -J me@203.0.113.10 -L 8265:localhost:8265 -L 6006:localhost:6006 -L 9190:localhost:9190 root@node001
 ```
 
-Then open `http://localhost:8265`, `http://localhost:6006`, or `http://localhost:9190` in your browser.
+`-J <login>` is a ProxyJump through the cluster login node; `localhost` after `-L` refers to the head node's loopback (where the dashboards listen). Then open `http://localhost:8265`, `http://localhost:6006`, or `http://localhost:9190` in your browser.
 
-**Important:** The SSH tunnel binds these ports on your **local machine** (where you run the `ssh` command). The remote head node (`node001` in this example) already has Prometheus listening. If you need to query from another cluster node, use `http://node001:9190` directly — do not assume `localhost:9190` on that node points to the job's Prometheus.
+**Important:** The SSH tunnel binds these ports on your **local machine** (where you run `ssh`). The same ports on other cluster nodes are not the job's services — every dashboard binds to the head's loopback only. To curl from a different machine on the cluster, SSH into the head first (`ssh node001 'curl http://localhost:9190/...'`) instead of trying to hit `node001:9190` directly.
 
-If a port is occupied locally (e.g., monitoring multiple jobs), change the first port number in `-L`. For example, `-L 18265:node001:8265` then access `http://localhost:18265`.
+If a port is occupied locally (e.g., monitoring multiple jobs), change the first port number in `-L`. For example, `-L 18265:localhost:8265` then access `http://localhost:18265`.
+
+### py-spy target selection in 1-GPU-per-process mode
+
+The Ray Dashboard's `py-spy dump / record` button profiles the training subprocess (not the Ray worker shell) via a wrapper that resolves the Ray worker PID to its child training process. In [1-GPU-per-process mode](job-submission.md#1-gpu-per-process-mode) each Ray actor has multiple training children (one per local GPU) — the wrapper picks **local rank 0** by default. To profile a different rank from the Dashboard, export `PYSPY_LOCAL_RANK=N` on the head node before invoking the button.
 
 ## Post-run diagnostics
 

@@ -36,5 +36,14 @@ if [[ $NODE_RANK -eq 0 ]]; then
     start_tensorboard "$@"
 fi
 
+# Run _train.sh as a child (NOT exec) so this shell stays alive and the
+# EXIT trap above runs `stop_ray_cluster` — i.e. `ray stop --force` plus
+# `pkill` of metrics_exporter / prometheus / tensorboard — before the
+# container exits and docker hard-kills everything.  An exec here would
+# replace this bash with _train.sh's, dropping the EXIT trap and leaving
+# Ray daemons to be SIGKILL'd by docker on container teardown; that
+# dirty shutdown races the actor's `ray.kill` in `_ray_actor.py` and
+# causes asymmetric rank-N exit-1 even when training succeeded.
 export USE_RAY=true
-exec "$SCRIPT_DIR/_train.sh" "$@"
+bash "$SCRIPT_DIR/_train.sh" "$@"
+exit "$?"

@@ -18,7 +18,7 @@ rocm-smi --showproductname   # AMD
 nvidia-smi -L                # NVIDIA
 ```
 
-Key differences by GPU (see `utils/mfu_tracker.py` for the full table):
+Key differences by GPU (see `utils/monkey_patch_maxtext.py` for the full table):
 
 | GPU | VRAM | FP8 TFLOPS | BF16 TFLOPS |
 |-----|------|------------|-------------|

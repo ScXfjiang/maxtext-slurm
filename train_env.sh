@@ -44,15 +44,23 @@ export XLA_FLAGS
 BLOCK_COMMENT_TO_USE_DOCKER_IMAGE_DEFAULT_XLA_FLAGS
 
 # ---- XLA dump (enable via _env_ENABLE_XLA_DUMP=1 in PASSTHROUGH_ARGS) ----
+# Scope dump to global rank 0 only to avoid concurrent writers racing on the
+# same xla_dump/ directory (all SPMD ranks compile identical HLO — rank 0's
+# dump is representative and keeps xla_dump/ a flat dir for downstream tools
+# like analyze_job.py and IRLens).
 ENABLE_XLA_DUMP="${ENABLE_XLA_DUMP:-${EXTRACTED_ENV_MAP[ENABLE_XLA_DUMP]:-0}}"
 if [[ "${ENABLE_XLA_DUMP,,}" =~ ^(1|y|yes|true)$ ]]; then
-    echo "[XLA dump] Enabled (ENABLE_XLA_DUMP=$ENABLE_XLA_DUMP)"
-    XLA_FLAGS="${XLA_FLAGS:+$XLA_FLAGS }--xla_dump_hlo_as_text"
-    XLA_FLAGS="$XLA_FLAGS --xla_dump_hlo_module_re=^jit_train_step$"
-    XLA_FLAGS="$XLA_FLAGS --xla_dump_hlo_pipeline_re='(?i)gpu'"
-    XLA_FLAGS="$XLA_FLAGS --xla_dump_to=${OUTPUT_PATH}/xla_dump"
-    export XLA_FLAGS
-    echo "[XLA dump] XLA_FLAGS=$XLA_FLAGS"
+    _dump_rank="${GLOBAL_RANK:-${NODE_RANK:-0}}"
+    if [[ "$_dump_rank" == "0" ]]; then
+        echo "[XLA dump] Enabled on rank 0 (ENABLE_XLA_DUMP=$ENABLE_XLA_DUMP)"
+        XLA_FLAGS="${XLA_FLAGS:+$XLA_FLAGS }--xla_dump_hlo_as_text"
+        XLA_FLAGS="$XLA_FLAGS --xla_dump_hlo_module_re=^jit_train_step$"
+        XLA_FLAGS="$XLA_FLAGS --xla_dump_hlo_pipeline_re='(?i)gpu'"
+        XLA_FLAGS="$XLA_FLAGS --xla_dump_to=${OUTPUT_PATH}/xla_dump"
+        export XLA_FLAGS
+        echo "[XLA dump] XLA_FLAGS=$XLA_FLAGS"
+    fi
+    unset _dump_rank
 fi
 
 # ---- Disable XLA's in-process one-shot ragged-all-to-all kernel (default OFF) ----
@@ -174,7 +182,7 @@ export NCCL_GDRCOPY_ENABLE=1
 export NCCL_GDR_FLUSH_DISABLE=1
 export NCCL_IB_ECE_ENABLE=0
 # NOTE: NCCL_IB_TC and NCCL_IB_FIFO_TC are auto-detected above (see utils/detect_nccl_env.sh).
-export NCCL_IB_GID_INDEX=1
+export NCCL_IB_GID_INDEX="${NCCL_IB_GID_INDEX:-1}"
 export NCCL_IB_PCI_RELAXED_ORDERING=1
 export NCCL_IB_USE_INLINE=1
 export NCCL_IGNORE_CPU_AFFINITY=1

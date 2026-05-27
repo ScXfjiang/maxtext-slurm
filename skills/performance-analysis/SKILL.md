@@ -9,6 +9,8 @@ Post-training (or mid-training) analysis pipeline. Follow the workflow below fro
 
 **Multi-job comparisons:** If comparing two or more jobs (e.g., "why is job B slower than job A?"), start with `skills/tsdb-diagnosis/SKILL.md` (Multi-Job Comparison workflow) **before** running TraceLens. The TSDB reveals system-level root causes — CPU contention from RCCL resource leaks, network errors, I/O pressure, thermal throttling — that TraceLens cannot observe (it only sees GPU-side kernel timings). Only proceed to TraceLens here if the TSDB comparison is inconclusive.
 
+**Deep per-kernel analysis:** When the user asks for per-kernel time breakdowns, step-time composition tables, cross-variant kernel comparisons, or whether a specific kernel is main-stream-blocking — switch to `skills/profile-drill/SKILL.md`. TraceLens's `kernel_launchers_summary_by_category.csv` has a known ~1.5×–2× inflation bug on 1-node/proc profiles (the `time ms per gpu` column divides by host count, not GPU count). `profile-drill` uses `utils/profile_drill.py` to read the raw xplane trace JSONs directly and avoids this bias.
+
 ## Workflow
 
 ### Step 1: Run the dispatcher
@@ -90,6 +92,8 @@ For deeper TraceLens analysis, read the CSVs in `<job_dir>/tracelens/<timestamp>
 - `kernel_launchers_summary_by_category.csv` — time by kernel category (GEMM, NCCL, XLA fusions, etc.)
 - `kernel_launchers_summary.csv` — time by individual kernel name
 
+> ⚠️ **TraceLens per-GPU CSV bias on 1-node/proc.** The `time ms per gpu` column in the two `kernel_launchers_summary*.csv` files divides total kernel time by **host count** (typically 8), not GPU count (typically 64) — so per-GPU numbers are ~1.5×–2× inflated on 1-node/proc profiles.  Percentages and category rankings are fine; absolute per-GPU kernel times are not.  For kernel-time numbers you can cite (e.g. in a report or step-time composition table), use `skills/profile-drill/SKILL.md` instead — it reads raw xplane trace JSONs and divides by auto-detected GPUs.
+
 ### Step 4: Summarize findings
 
 Present results using this structure:
@@ -118,10 +122,10 @@ If the dashboard is not running, start it:
 
 ```bash
 pip install fastapi uvicorn   # one-time
-utils/perf_server.py --host 0.0.0.0 &
+utils/perf_server.py &        # binds 127.0.0.1 by default
 ```
 
-**Always tell the user the dashboard URL:** `http://<host>:<PORT>`
+**Always tell the user the dashboard URL:** `http://localhost:<PORT>`. For remote access, instruct them to tunnel: `ssh -L <PORT>:localhost:<PORT> user@host`. Avoid `--host 0.0.0.0` — `perf_server.py` has no auth.
 
 The server auto-detects a free port starting from 8080 and auto-reloads `analysis.json` on each request.
 
@@ -135,14 +139,19 @@ The server auto-detects a free port starting from 8080 and auto-reloads `analysi
   analysis.json                                 # structured metrics
   xla_dump/                                     # if _env_ENABLE_XLA_DUMP=1
     module_NNNN.jit_train_step.*_gpu_after_optimizations.txt
-  <run_name>/tensorboard/plugins/profile/<ts>/
-    <hostname>.xplane.pb                        # if profiler=xplane
-  tracelens/<ts>/csvs/*.csv                     # created by TraceLens
+  <run_name>/tensorboard/plugins/profile/<ts>/  # if profiler=xplane
+    <hostname>.xplane.pb                        #   1-node/proc: one per host
+  <run_name>/tensorboard/plugins/profile/<ts_i>/ # 1-GPU/proc (LOCAL_WORLD_SIZE ts dirs,
+    <hostname>.proc<N>.xplane.pb                #   one file per host per ts;
+                                                #   successive serialized writes land
+                                                #   in different per-second ts dirs)
+  tracelens/<ts>/csvs/*.csv                     # 1-node/proc: TraceLens output
+  tracelens/<ts_i>/<hostname>.proc<N>/csvs/*.csv # 1-GPU/proc: one dir per GPU
 ```
 
 The `.log` file sits alongside the directory in `<JOB_WORKSPACE>/`.
 
-When `enable_checkpointing=true`, profiler traces may end up in a shared directory outside the job dir. `analyze_job.py` parses `Config param tensorboard_dir` from the log to locate these. The dispatcher and `perf_server.py` filter profiles by job execution time window and node-0 hostname to disambiguate.
+When `enable_checkpointing=true`, profiler traces may end up in a shared directory outside the job dir. `analyze_job.py` parses `Config param tensorboard_dir` from the log to locate these. The dispatcher and `perf_server.py` filter profiles by job execution time window and node-0 hostname to disambiguate. In 1-GPU-per-process mode the node-0 filter `name.startswith("<host>.")` still matches all `<host>.proc<N>.xplane.pb` files, so TraceLens runs once per GPU on node 0; the multiple timestamp dirs (one per serialized write) are treated like periodic-profiling windows by the existing code.
 
 ### Running individual tools directly
 
@@ -162,6 +171,11 @@ utils/IRLens_analyze_hlo_ir.py <hlo_file> --op computation
 TraceLens_generate_perf_report_jax \
     --profile_path <xplane.pb> \
     --output_csvs_dir <output_dir>/csvs
+
+# profile_drill.py — direct per-kernel analysis from trace JSONs
+# (use when TraceLens's per-GPU numbers are suspect or you need kernel-level
+# ground truth; see skills/profile-drill/SKILL.md)
+utils/profile_drill.py <job_dir>/.../tensorboard/plugins/profile/*/*.trace.json.gz
 ```
 
 ### `RAY=1` Slurm log truncation

@@ -82,10 +82,13 @@ Web dashboard for visualizing analysis results — TGS charts, TraceLens GPU uti
 # utils/perf_server.py [--host HOST] [--port PORT] [--outputs-dir DIR]
 #
 # Examples:
-#   utils/perf_server.py                                    # auto-picks port from 8080
-#   utils/perf_server.py --host 0.0.0.0                     # remote access (auto port)
-#   utils/perf_server.py --host 0.0.0.0 --port 8080         # explicit port
+#   utils/perf_server.py                                    # localhost only, auto-picks port from 8080
+#   utils/perf_server.py --port 8080                        # localhost only, explicit port
 #   utils/perf_server.py --outputs-dir /shared/maxtext_jobs # custom outputs dir
+#
+# Default bind is 127.0.0.1.  For remote access prefer SSH tunneling
+# (`ssh -L 8080:localhost:8080 user@host`) over --host 0.0.0.0; the
+# dashboard has no auth and a wide bind exposes job metadata.
 ```
 
 Requires `pip install fastapi uvicorn`.

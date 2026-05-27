@@ -18,9 +18,16 @@ This skill requires a Prometheus TSDB, which is only available for `RAY=1` jobs.
 
 ## Remote Execution via Ray Jobs API
 
-For `RAY=1` live jobs, the **Ray Jobs API** (`http://<head_host>:8265/api/jobs/`) is a universal remote execution mechanism. It runs arbitrary Python inside the job's Docker containers — no SSH, no Slurm CLI required. As long as the Ray head node is reachable over HTTP, you can inspect and operate on any node in the cluster.
+For `RAY=1` live jobs, the **Ray Jobs API** (`http://localhost:8265/api/jobs/` *on the head node*) is a universal remote execution mechanism. It runs arbitrary Python inside the job's Docker containers — no Slurm CLI required.
 
-**Why this matters:** In many environments, the diagnosis machine has no SSH access to compute nodes and no Slurm CLI. The Ray Jobs API is the only way to reach inside the running containers. It is used throughout this skill for process inspection, dmesg reading, file delivery, and observability stack management.
+**Security note (two-part fix):** Two separate Ray attack surfaces are closed by default in this repo:
+
+1. *Dashboard / job-submission HTTP* (port 8265) — Ray's `JobSubmissionClient` HTTP API is unauthenticated; on a host with a public IP, binding to `0.0.0.0` lets an internet scanner submit code that runs as root inside the training container. Fix: bind dashboard, Prometheus, TensorBoard to `127.0.0.1` on the head node; legitimate diagnostics SSH into the head and curl `http://localhost:<port>/...` from there.
+2. *GCS / coordination ports* (`RAY_PORT` for Ray, `JAX_COORDINATOR_PORT` for JAX) — these are unauthenticated cross-node services; on a public IP, internet scanners can join the cluster as raylets within seconds of `ray start --head` and execute code in the actor pool. Fix: `--node-ip-address=<cluster-private-IP>` on `ray start` (head + workers) and the JAX coordinator pinned to the cluster's RFC1918 subnet via `detect_cluster_ip()` (in `utils/detect_ip.sh`). Workers reach the head over the private subnet only; internet scanners can no longer connect.
+
+Both endpoints — dashboard *and* GCS / JAX coordinator — are off the public internet.
+
+**Why this matters:** In many environments, the diagnosis machine has no Slurm CLI. The Ray Jobs API is still the only way to reach inside the running containers — it just needs an SSH hop now. The agent uses `host_cmd.py` (or direct `ssh`) to reach the head node.
 
 **Safety boundary — what you can and cannot do:**
 
@@ -35,22 +42,22 @@ For `RAY=1` live jobs, the **Ray Jobs API** (`http://<head_host>:8265/api/jobs/`
 
 **Critical rule:** Never kill a training process. In a distributed job, killing one trainer on one node causes all other nodes to hang waiting for the dead peer, eventually crashing the entire job (heartbeat timeout or NCCL timeout across all N nodes). The observability stack (metrics exporter, plugins, Prometheus) is fully decoupled — you can tear it down and rebuild it without any training impact.
 
-**Submitting a job:**
+**Submitting a job (run from the head node — ssh in first):**
 
 ```bash
-curl -s -X POST 'http://<head_host>:8265/api/jobs/' \
+ssh <head_host> "curl -s -X POST 'http://localhost:8265/api/jobs/' \
   -H 'Content-Type: application/json' \
-  -d '{"entrypoint": "python3 -c \"<python_code>\"", "runtime_env": {}}'
+  -d '{\"entrypoint\": \"python3 -c \\\"<python_code>\\\"\", \"runtime_env\": {}}'"
 ```
 
-**Polling for results:**
+**Polling for results (also from the head node):**
 
 ```bash
-# Check status
-curl -s 'http://<head_host>:8265/api/jobs/<job_id>'
-# Read stdout/stderr
-curl -s 'http://<head_host>:8265/api/jobs/<job_id>/logs'
+ssh <head_host> "curl -s 'http://localhost:8265/api/jobs/<job_id>'"
+ssh <head_host> "curl -s 'http://localhost:8265/api/jobs/<job_id>/logs'"
 ```
+
+If you've already opened the standard `ssh -L 8265:localhost:8265 -J <login> <head>` tunnel for the dashboard UI, you can also curl `http://localhost:8265/...` directly from your laptop without re-SSHing for each call.
 
 **Node targeting:** By default, Ray jobs run on the head node. To inspect a specific worker node, the Ray job's Python code must explicitly discover and connect to that node's resources, or you can use node-local information (like hostname) to verify which node the job landed on. For operations that must run on a specific node (e.g., reading that node's dmesg), you may need to submit multiple jobs and check which node each lands on, or use Ray's scheduling hints.
 
@@ -77,7 +84,7 @@ This API is referenced throughout the skill — in "Metrics Exporter Operations 
 
    **Critical rule: never delete a TSDB lock file, and never run `prometheus.sh view` against a running job's TSDB.** The lock is held by the live Prometheus instance. Deleting it or starting a second instance against the same TSDB risks data corruption. For finished/crashed jobs, `prometheus.sh view` handles stale lock files automatically (Prometheus detects and replaces them).
 
-   **Case A — Live job (still running):** Prometheus is already running on the job's head node (task 0). Find the head node hostname and port from the SSH tunnel command in the job log (`ssh -L ... <head_host>:<port>`). The port is usually 9190 but may differ if 9190 was occupied at job start (the startup script auto-increments: 9191, 9192, ...). Also check for `[Prometheus] WARNING: port 9190 was occupied; using <port> instead` in the log. Query at `http://<head_host>:<port>` — **not** `localhost:<port>`. The head node hostname comes from the log (e.g., `chi2816`); `localhost:9090` on the machine you are running from may be a completely different Prometheus (e.g., a cluster-level monitor). The SSH tunnel command in the log is for the **user's machine** to reach the head node through a jump host — it binds the port on the user's machine (which may be a laptop or the same cluster node you are on), not on the head node. If the user has set up such a tunnel on this machine, `localhost:<port>` already points to the live Prometheus — do not shadow it by starting another instance. Do **not** start a second Prometheus instance for a live job.
+   **Case A — Live job (still running):** Prometheus is already running on the job's head node (task 0), bound to `127.0.0.1` (security hardening; the ProxyJump tunnel command in the log is the legitimate access path for users). Find the head node hostname and port from the SSH tunnel command in the job log (`ssh -J <login> -L <port>:localhost:<port> root@<head>`). The port is usually 9190 but may differ if 9190 was occupied at job start (the startup script auto-increments: 9191, 9192, ...). Also check for `[Prometheus] WARNING: port 9190 was occupied; using <port> instead` in the log. Query via `ssh <head_host> 'curl -s http://localhost:<port>/api/v1/...'` — **not** by hitting `<head_host>:<port>` directly from elsewhere (the bind is loopback-only). The head node hostname comes from the job log; on your local machine, `localhost:9090` may be a completely different Prometheus (e.g., a cluster-level monitor). If the user has opened the documented `ssh -J ... -L <port>:localhost:<port> root@<head>` tunnel on the machine you are running from, `localhost:<port>` already points to the live Prometheus — do not shadow it by starting another instance. Do **not** start a second Prometheus instance for a live job.
 
    **Case A fallback — Live job but Prometheus is unreachable:** If the head node's Prometheus doesn't respond (connection timeout, firewall, network partition between your machine and the head node), you can still access the TSDB data by copying the immutable blocks (not the WAL or lock file) to a temporary directory and running a read-only Prometheus against the copy. **Run the port scan first** (same as Case B — `ss -tlnp | grep 919`) to find a free port:
    ```bash
@@ -88,7 +95,7 @@ This API is referenced throughout the skill — in "Metrics Exporter Operations 
    ```
    This gives you access to all compacted data but **not** the most recent uncompacted samples still in the WAL. Expect a gap of up to 2 hours at the end of the data. For a long-running job, this is usually sufficient. Clean up in step 8: kill the process first (`kill $PROM_FALLBACK_PID`), then remove the data copy (`rm -rf /tmp/prom_<jobid>_readonly`).
 
-   **Case B — Finished job (completed, failed, or cancelled):** Before starting a read-only Prometheus, **always scan for occupied ports first**. The user may have SSH tunnels on this machine forwarding to live Prometheus instances on remote head nodes (e.g., `ssh -L 9190:chi2816:9190 ...` makes the live job's Prometheus available at `localhost:9190`). Starting a read-only Prometheus on the same port would shadow the live database and break the user's monitoring.
+   **Case B — Finished job (completed, failed, or cancelled):** Before starting a read-only Prometheus, **always scan for occupied ports first**. The user may have SSH tunnels on this machine forwarding to live Prometheus instances on remote head nodes (e.g., `ssh -L 9190:<head>:9190 ...` makes the live job's Prometheus available at `localhost:9190`). Starting a read-only Prometheus on the same port would shadow the live database and break the user's monitoring.
    ```bash
    ss -tlnp | grep 919
    ```
@@ -111,11 +118,11 @@ This API is referenced throughout the skill — in "Metrics Exporter Operations 
    utils/prometheus.sh view <job_B_dir>/prometheus -p <free_port_2> &
    PROM_PID_B=$!
    ```
-   If one of the jobs is still live, query its existing Prometheus at `http://<head_host>:<port>` (Case A) alongside the read-only instances on localhost. Jobs without a TSDB (`RAY=0`) can only be compared using log-based data from the triage skill. Query each Prometheus on its own address/port and compare results side by side.
+   If one of the jobs is still live, query its existing Prometheus via `ssh <head_host> 'curl ... http://localhost:<port>/...'` (Case A) alongside the read-only instances on localhost. Jobs without a TSDB (`RAY=0`) can only be compared using log-based data from the triage skill. Query each Prometheus on its own address/port and compare results side by side.
 
 3. **Always query all metrics first.** Before any diagnostic work, discover what the TSDB contains. This tells you which metric families were collected, how many nodes are present, and what time range is covered — essential context for choosing the right queries and interpreting results.
 
-   In the examples below, replace `<host>:<port>` with the address from step 2: `<head_host>:<port>` for live jobs (Case A), or `localhost:<port>` for read-only instances (Cases B/C).
+   In the examples below, replace `<host>:<port>` with the address from step 2: `localhost:<port>` for read-only instances (Cases B/C). For live jobs (Case A), prefix every `curl` with `ssh <head_host>` and use `localhost:<port>` on the head — the live Prometheus binds to loopback and is unreachable from other hosts directly.
 
    **For read-only instances (Case B/C), always start with `api/v1/status/tsdb`** to find the time range before any data queries. This endpoint doesn't need a timestamp and tells you the min/max times the TSDB covers. Without this, you won't know what `&time=` values to use for instant queries.
 
@@ -428,19 +435,22 @@ Plugins are re-read from disk on every poll cycle (~10s). To deploy a fix:
 1. Overwrite the plugin file at the artifact path inside the container.
 2. The next poll cycle picks up the new code automatically. No process restart needed.
 
+**Network note:** The Ray dashboard *and* the per-job Prometheus query API both bind to `127.0.0.1` only on the head node (user-facing HTTP hardening). All `curl http://localhost:8265/...` and `curl http://localhost:9190/...` examples below assume you've already SSH'd to the head node (e.g., `ssh <head_host>` or `host_cmd.py "ssh <head_host> ..."`). The `localhost` in the URL refers to the head node's loopback, not your laptop. Inter-node Ray (worker → head GCS) and the JAX coordinator bind to the cluster-private IP (RFC1918) via `detect_cluster_ip()` — workers reach the head over the private subnet only, never the public internet. Prometheus *scraping* (head → worker exporters on `:9400`) is intentionally cross-node-reachable on the private subnet so Prometheus can pull metrics from each node.
+
 **File delivery caveat:** The plugin files live at `<artifact_dir>/utils/` inside the container. The artifact directory is bind-mounted from the host NFS, but **NFS attribute caching** can delay visibility of changes by 30-60s or indefinitely. To guarantee immediate delivery, use the **Ray Jobs API** to copy the file inside the container:
 
 ```bash
-# From any machine that can reach the Ray head node:
-curl -s -X POST 'http://<head_host>:8265/api/jobs/' \
+# Run on the head node (ssh there first).  Use a shell command (not python -c)
+# so we avoid nested-quote escaping inside the JSON entrypoint string.
+curl -s -X POST 'http://localhost:8265/api/jobs/' \
   -H 'Content-Type: application/json' \
   -d '{
-    "entrypoint": "python3 -c \"import shutil; shutil.copy2(\"/path/on/nfs/plugin.sh\", \"/artifact_dir/utils/plugin.sh\")\"",
+    "entrypoint": "cp -p /path/on/nfs/plugin.sh /artifact_dir/utils/plugin.sh && echo done",
     "runtime_env": {}
   }'
 ```
 
-The Ray job runs inside the container, bypassing NFS attribute cache issues.
+The Ray job runs inside the container, bypassing NFS attribute cache issues. If you do need Python (e.g., for a complex transformation), put the script on shared storage and call `python3 /path/on/nfs/script.py` rather than embedding `python3 -c "..."` in the JSON.
 
 **Case 2 — Exporter hotfix (metrics_exporter.sh):**
 
@@ -449,8 +459,9 @@ The exporter is a long-running process — overwriting the file alone does nothi
 2. Kill the running exporter process. The watchdog detects the exit and restarts it with the updated code.
 
 ```bash
+# Run on the head node (ssh there first).
 # Kill the exporter (via Ray Jobs API, targeting a specific node):
-curl -s -X POST 'http://<head_host>:8265/api/jobs/' \
+curl -s -X POST 'http://localhost:8265/api/jobs/' \
   -H 'Content-Type: application/json' \
   -d '{
     "entrypoint": "python3 -c \"import subprocess, os; subprocess.run([\\\"pkill\\\", \\\"-f\\\", \\\"metrics_exporter.sh\\\"])\"",
@@ -469,8 +480,10 @@ curl -s -X POST 'http://<head_host>:8265/api/jobs/' \
 For any ad-hoc operation inside a container (checking process state, reading dmesg, killing specific processes), use the Ray Jobs API (see "Remote Execution via Ray Jobs API" section above). Common diagnostic commands:
 
 ```bash
+# All commands below run on the head node (ssh there first).
+
 # Check for D-state processes on the cluster
-curl -s -X POST 'http://<head_host>:8265/api/jobs/' \
+curl -s -X POST 'http://localhost:8265/api/jobs/' \
   -H 'Content-Type: application/json' \
   -d '{
     "entrypoint": "python3 -c \"import subprocess; r=subprocess.run([\\\"ps\\\",\\\"axo\\\",\\\"pid,stat,wchan:30,cmd\\\"], capture_output=True, text=True); d=[l for l in r.stdout.splitlines() if l.split()[1:2] and l.split()[1][0]==\\\"D\\\"]; print(f\\\"D-state: {len(d)}\\\"); [print(l.strip()) for l in d[:20]]\"",
@@ -478,7 +491,7 @@ curl -s -X POST 'http://<head_host>:8265/api/jobs/' \
   }'
 
 # Read GPU-related dmesg errors
-curl -s -X POST 'http://<head_host>:8265/api/jobs/' \
+curl -s -X POST 'http://localhost:8265/api/jobs/' \
   -H 'Content-Type: application/json' \
   -d '{
     "entrypoint": "python3 -c \"import subprocess; r=subprocess.run([\\\"dmesg\\\",\\\"--level=err,warn\\\",\\\"-T\\\"], capture_output=True, text=True); lines=[l for l in r.stdout.splitlines() if \\\"amdgpu\\\" in l.lower() or \\\"drm\\\" in l.lower() or \\\"cper\\\" in l.lower()]; print(f\\\"GPU dmesg lines: {len(lines)}\\\"); [print(l) for l in lines[-30:]]\"",
@@ -486,7 +499,7 @@ curl -s -X POST 'http://<head_host>:8265/api/jobs/' \
   }'
 
 # Get kernel and driver version
-curl -s -X POST 'http://<head_host>:8265/api/jobs/' \
+curl -s -X POST 'http://localhost:8265/api/jobs/' \
   -H 'Content-Type: application/json' \
   -d '{
     "entrypoint": "python3 -c \"import subprocess; print(subprocess.run([\\\"uname\\\",\\\"-r\\\"], capture_output=True, text=True).stdout.strip()); print(open(\\\"/sys/module/amdgpu/version\\\").read().strip())\"",
@@ -1031,7 +1044,7 @@ Hard-won lessons from real diagnosis sessions. Avoid these mistakes:
 
 1. **Empty results from read-only Prometheus.** If an instant query returns empty `result: []`, you almost certainly forgot the `&time=` parameter. Read-only Prometheus defaults to "now" which is past the end of the data. Use `api/v1/status/tsdb` to find the TSDB time range (step 3), then always include `&time=<max_ts>` for instant queries.
 
-2. **Querying the wrong Prometheus.** `localhost:9090` on the head node may be a cluster-level Prometheus, not the job's Prometheus. The job's Prometheus runs on `<head_host>:9190` (or the auto-incremented port). Always verify the TSDB by cross-checking `tb_step`/`tb_learning_loss` against the job log. If the metrics don't match (wrong metric families, wrong step range), you're querying the wrong database.
+2. **Querying the wrong Prometheus.** `localhost:9090` on the head node may be a cluster-level Prometheus, not the job's Prometheus. The job's Prometheus runs on `127.0.0.1:9190` *on the head node* (or the auto-incremented port — bound to loopback only since 2026-05-03). Reach it with `ssh <head_host> 'curl http://localhost:9190/...'`. Always verify the TSDB by cross-checking `tb_step`/`tb_learning_loss` against the job log. If the metrics don't match (wrong metric families, wrong step range), you're querying the wrong database.
 
 3. **Mixing up databases in multi-job comparison.** When running multiple read-only Prometheus instances on different ports, it's easy to send a query to the wrong port. Label each port clearly (e.g., "9190 = job 7879, 9191 = job 7882") and verify each with the `tb_step` cross-check before starting diagnostic work.
 

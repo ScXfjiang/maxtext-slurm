@@ -9,7 +9,7 @@ python3 -c "import TraceLens; print(TraceLens.__path__[0])"
 
 ## Patch sequence
 
-Apply these patches in order. There are 6 files, 13 patches total.
+Apply these patches in order. There are 6 files, 14 patches total.
 
 ---
 
@@ -315,7 +315,52 @@ Remove the pid guard — `cat == "kernel"` already identifies GPU events. Also g
                 if "hlo_op" in args:
 ```
 
-## File 6: `TraceLens/TreePerf/tree_perf.py` (launch latency)
+## File 6a: `TraceLens/TreePerf/tree_perf.py` (XLA dtype map)
+
+### Problem
+`get_df_xla_perf` has a small `dtype_to_bytes` dict that crashes with `KeyError: 'c64'` (or other dtypes) when an HLO op operand uses a dtype not in the dict. Common offenders: `c64`/`c128` (complex), `s8`/`s64`, `f8*` (fp8 variants), `pred`, `token`.
+
+### Fix (1 patch)
+Expand the dict to cover all common XLA dtypes and use `.get(dtype, 0)` so unknown dtypes degrade gracefully instead of crashing.
+
+```python
+# OLD
+        dtype_to_bytes = {
+            "f32": 4,
+            "bf16": 2,
+            "s32": 4,
+            "fp16": 2,
+            "u32": 4,
+            "f16": 2,
+            "u64": 8,
+        }
+        # ...
+                if shape and dtype:
+                    total_input_bytes = (
+                        total_input_bytes + np.prod(shape) * dtype_to_bytes[dtype]
+                    )
+
+# NEW
+        dtype_to_bytes = {
+            "pred": 1,
+            "s4": 1, "u4": 1,
+            "s8": 1, "u8": 1, "f8": 1, "f8e4m3fn": 1, "f8e5m2": 1, "f8e4m3fnuz": 1, "f8e5m2fnuz": 1,
+            "s16": 2, "u16": 2, "f16": 2, "bf16": 2, "fp16": 2,
+            "s32": 4, "u32": 4, "f32": 4,
+            "s64": 8, "u64": 8, "f64": 8,
+            "c64": 8, "c128": 16,
+            "token": 0,
+        }
+        # ...
+                if shape and dtype:
+                    total_input_bytes = (
+                        total_input_bytes + np.prod(shape) * dtype_to_bytes.get(dtype, 0)
+                    )
+```
+
+---
+
+## File 6b: `TraceLens/TreePerf/tree_perf.py` (launch latency)
 
 ### Problem
 `get_GPU_kernel_launch_latency` accesses `self.tree.events_by_uid[event.get("parent")]` but kernel events from remapped multi-node pids may have `parent=None` (not linked to CPU launch events). This causes `KeyError: None`.

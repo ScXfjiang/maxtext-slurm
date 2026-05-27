@@ -349,7 +349,7 @@ def _parse_kernel_category_csv(path: Path) -> list[dict] | None:
 def _nodelist_first(nodelist: str) -> str:
     """Return the first hostname from a NODELIST string.
 
-    Handles Slurm bracket notation (``chi[2815-2817,2820]`` → ``chi2815``),
+    Handles Slurm bracket notation (``node[001-003,005]`` → ``node001``),
     comma-separated (``node01,node02`` → ``node01``), and plain strings.
     """
     bracket = nodelist.find("[")
@@ -385,43 +385,65 @@ def _node0_hostname(job_dir: Path) -> str | None:
 
 
 def _find_tracelens_profiles(job_dir: Path) -> list[str]:
-    """List available TraceLens profile timestamps (sorted, latest last).
+    """List available TraceLens profile keys (sorted, latest last).
 
-    Only returns timestamps whose profile directory contains node 0's
-    xplane file (the coordinator is the representative host in SPMD).
-    Falls back to all timestamps if node 0 can't be determined.
+    Supports two on-disk layouts written by :func:`analyze_job._tracelens_output_dir`:
+      * Flat (1-node/proc): ``tracelens/<ts>/csvs/`` → profile key is ``<ts>``.
+      * Nested (1-GPU/proc, one per local rank): ``tracelens/<ts>/<stem>/csvs/``
+        → profile key is ``<ts>/<stem>``.
+
+    Only returns keys whose xplane file (the one TraceLens consumed) is on
+    node 0 — the SPMD representative host — when we can determine node 0.
     """
     tl_dir = job_dir / "tracelens"
     if not tl_dir.is_dir():
         return []
-    all_ts = sorted(
-        d.name for d in tl_dir.iterdir()
-        if d.is_dir() and (d / "csvs").is_dir()
-    )
-    if not all_ts:
+
+    # Collect every csvs/ directory under tracelens/ (depth 1 or 2).
+    all_keys: list[str] = []
+    for ts_dir in sorted(tl_dir.iterdir()):
+        if not ts_dir.is_dir():
+            continue
+        if (ts_dir / "csvs").is_dir():
+            all_keys.append(ts_dir.name)  # flat: <ts>
+            continue
+        for sub in sorted(ts_dir.iterdir()):
+            if sub.is_dir() and (sub / "csvs").is_dir():
+                all_keys.append(f"{ts_dir.name}/{sub.name}")  # nested: <ts>/<stem>
+    if not all_keys:
         return []
 
     node0 = _node0_hostname(job_dir)
     if not node0:
-        return all_ts
+        return all_keys
 
-    # Find profile root that contains xplane files
+    # For flat keys: keep if node0 xplane lives in that <ts> dir.
+    # For nested keys: the stem carries the hostname (<host>.proc<N>), so keep
+    # iff the stem starts with node0.
     profile_roots = sorted(job_dir.rglob("plugins/profile"))
-    if not profile_roots:
-        return all_ts
+    flat_ts_with_node0: set[str] = set()
+    if profile_roots:
+        for pr in profile_roots:
+            for ts_dir in pr.iterdir():
+                if ts_dir.is_dir() and any(ts_dir.glob(f"{node0}.*xplane.pb")):
+                    flat_ts_with_node0.add(ts_dir.name)
 
-    node0_ts = set()
-    for pr in profile_roots:
-        for ts_dir in pr.iterdir():
-            if ts_dir.is_dir() and any(ts_dir.glob(f"{node0}.*xplane.pb")):
-                node0_ts.add(ts_dir.name)
+    def _keep(key: str) -> bool:
+        if "/" in key:
+            ts, stem = key.split("/", 1)
+            return stem.startswith(node0 + ".")
+        return not flat_ts_with_node0 or key in flat_ts_with_node0
 
-    filtered = [ts for ts in all_ts if ts in node0_ts]
-    return filtered if filtered else all_ts
+    filtered = [k for k in all_keys if _keep(k)]
+    return filtered if filtered else all_keys
 
 
 def _resolve_tracelens_csvs(job_dir: Path, profile: str | None) -> Path | None:
-    """Resolve the csvs directory for a given profile (or latest)."""
+    """Resolve the csvs directory for a given profile key (or latest).
+
+    The *profile* string is whatever :func:`_find_tracelens_profiles`
+    returns — either ``<ts>`` (flat) or ``<ts>/<stem>`` (nested).
+    """
     tl_dir = job_dir / "tracelens"
     if not tl_dir.is_dir():
         return None
@@ -430,7 +452,6 @@ def _resolve_tracelens_csvs(job_dir: Path, profile: str | None) -> Path | None:
         csvs = tl_dir / profile / "csvs"
         return csvs if csvs.is_dir() else None
 
-    # Default: latest per-timestamp profile
     profiles = _find_tracelens_profiles(job_dir)
     if profiles:
         return tl_dir / profiles[-1] / "csvs"
@@ -792,7 +813,9 @@ def main():
     )
     parser.add_argument(
         "--host", default="127.0.0.1",
-        help="bind address (default: 127.0.0.1, use 0.0.0.0 for remote access)",
+        help="bind address (default: 127.0.0.1). For remote access, prefer "
+             "SSH tunneling (ssh -L PORT:localhost:PORT user@host) over "
+             "--host 0.0.0.0 — the dashboard has no auth.",
     )
     parser.add_argument(
         "--port", type=int, default=None,

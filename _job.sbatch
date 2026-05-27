@@ -29,6 +29,7 @@ export LOGIN_NODE_IP="${LOGIN_NODE_IP:-${USER}@${SLURM_SUBMIT_HOST}}"
 export NODELIST_EXPANDED=$(scontrol show hostnames "$SLURM_JOB_NODELIST" 2>/dev/null | tr '\n' ',' | sed 's/,$//')
 
 source "$SCRIPT_DIR/utils/pick_port.sh"
+source "$SCRIPT_DIR/utils/detect_ip.sh"
 
 JAX_PORT=$(pick_free_port) || { echo "FATAL: Could not find a free port for JAX coordinator" >&2; exit 1; }
 
@@ -38,6 +39,15 @@ if [[ "${USE_RAY:-false}" == "true" ]]; then
     RAY_PORT=$(pick_free_port "$JAX_PORT") || { echo "FATAL: Could not find a free port for Ray" >&2; exit 1; }
     export RAY_PORT
 fi
+
+# SECURITY: pin the JAX coordinator to this node's cluster-private IP
+# instead of letting srun fall back to SLURM_LAUNCH_NODE_IPADDR (which is
+# the launching node's public IP).  Combined with `--node-ip-address` on
+# `ray start` (utils/ray_cluster.sh), this keeps every cross-node service
+# bound to the private subnet only.  Without this, the JAX coordinator
+# would bind on the public IP and become reachable from the internet (an
+# unauthenticated coordinator is itself an attack surface).
+export JAX_COORDINATOR_IP="${JAX_COORDINATOR_IP:-$(detect_cluster_ip)}"
 
 # Split args first
 source "$SCRIPT_DIR/utils/split_script_args.sh"

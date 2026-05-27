@@ -287,7 +287,7 @@ def _log_has_tgs_data(log_file: Path) -> bool:
 def nodelist_first(nodelist: str) -> str:
     """Return the first hostname from a NODELIST string.
 
-    Handles Slurm bracket notation (``chi[2815-2817,2820]`` → ``chi2815``),
+    Handles Slurm bracket notation (``node[001-003,005]`` → ``node001``),
     comma-separated (``node01,node02`` → ``node01``), and plain strings.
     """
     bracket = nodelist.find("[")
@@ -545,23 +545,47 @@ def _parse_one_tracelens_csv(csv_path: Path) -> dict | None:
 def _parse_tracelens_summary(job_dir: Path) -> dict | None:
     """Parse TraceLens gpu_events_averages.csv for summary percentages.
 
-    Each profiling window lives under ``tracelens/<ts>/csvs/``.  When
-    multiple profiles exist (periodic profiling), uses the latest
-    timestamp directory (most representative of steady-state training).
+    Layouts:
+      * 1-node/proc: ``tracelens/<ts>/csvs/gpu_events_averages.csv``.
+      * 1-GPU/proc (via ``monkey_patch_maxtext.py``'s xplane-tagging shim):
+        ``tracelens/<ts>/<host>.proc<N>/csvs/gpu_events_averages.csv`` —
+        one csvs dir per local rank.  Because ``monkey_patch_maxtext.py``
+        serializes ``stop_trace``, successive same-host writes typically
+        land in distinct per-second ``<ts>`` dirs, so each ``<ts>`` usually
+        contains exactly one ``<host>.proc<N>`` stem; any that contain
+        more than one are averaged here.
+
+    When multiple profiles exist (periodic profiling, or the per-local-rank
+    fan-out under 1-GPU/proc), uses the latest timestamp directory (most
+    representative of steady-state).  In SPMD the per-rank figures agree
+    to within ~1 %, so picking the latest ``<ts>``'s value (or averaging
+    co-resident stems) is already a faithful high-level summary.
     """
     tl_dir = job_dir / "tracelens"
     if not tl_dir.is_dir():
         return None
 
-    ts_dirs = sorted(
-        d for d in tl_dir.iterdir()
-        if d.is_dir() and (d / "csvs").is_dir()
-    )
-    # Use the latest timestamp (most representative of steady-state)
+    ts_dirs = sorted(d for d in tl_dir.iterdir() if d.is_dir())
+    # Use the latest timestamp (most representative of steady-state).
     for ts_dir in reversed(ts_dirs):
+        # Flat layout: <ts>/csvs/...
         result = _parse_one_tracelens_csv(ts_dir / "csvs" / "gpu_events_averages.csv")
         if result:
             return result
+        # Nested layout: <ts>/<stem>/csvs/... — average across any stems
+        # co-resident in this ts dir (usually just one under flock serialization).
+        per_stem = [
+            _parse_one_tracelens_csv(sub / "csvs" / "gpu_events_averages.csv")
+            for sub in ts_dir.iterdir() if sub.is_dir()
+        ]
+        per_stem = [r for r in per_stem if r]
+        if per_stem:
+            keys = set().union(*(r.keys() for r in per_stem))
+            return {
+                k: round(sum(r[k] for r in per_stem if k in r)
+                         / sum(1 for r in per_stem if k in r), 2)
+                for k in keys
+            }
 
     return None
 
@@ -792,9 +816,22 @@ def _tracelens_output_dir(job_dir: Path, xplane_file: Path) -> Path:
     We use the ``<ts>`` directory name to key each TraceLens output so that
     periodic profiling (``profile_periodically_period``) produces separate
     results per profiling window: ``tracelens/<ts>/csvs/*.csv``.
+
+    In 1-GPU-per-process mode the xplane filename carries a ``.proc<N>``
+    segment (``<host>.proc<N>.xplane.pb`` — see ``monkey_patch_maxtext.py``'s
+    ``_maybe_tag_profiler_output_with_local_rank``), so multiple per-GPU
+    reports from the same host would collide at the flat path.  We nest
+    those under the xplane's stem: ``tracelens/<ts>/<host>.proc<N>/csvs/*.csv``.
     """
     ts_dir = xplane_file.parent.name
-    return job_dir / "tracelens" / ts_dir
+    base = job_dir / "tracelens" / ts_dir
+    stem = xplane_file.name.removesuffix(".xplane.pb")
+    # Keep the historical flat layout for 1-node/proc (single process per
+    # host → one ``<host>.xplane.pb``).  Nest only when the filename tells
+    # us the 1-GPU/proc shim is in play.
+    if ".proc" in stem:
+        return base / stem
+    return base
 
 
 def _tracelens_is_done(output_dir: Path) -> bool:
@@ -1147,12 +1184,14 @@ def _dashboard_hint() -> None:
     if port is not None:
         print(
             f"\n{CYAN}Dashboard:{RESET} "
-            f"http://0.0.0.0:{port}  (running)"
+            f"http://127.0.0.1:{port}  (running; "
+            f"tunnel with `ssh -L {port}:localhost:{port}` for remote access)"
         )
     else:
         print(
             f"\n{CYAN}Start dashboard:{RESET}  "
-            f"utils/perf_server.py --host 0.0.0.0"
+            f"utils/perf_server.py  "
+            f"(localhost only — tunnel via SSH for remote access)"
         )
 
 

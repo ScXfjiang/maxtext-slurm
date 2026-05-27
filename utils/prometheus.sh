@@ -78,7 +78,14 @@ start_prometheus() {
         done
     fi
 
-    cat > /tmp/ray_prometheus.yml <<EOF
+    PROMETHEUS_DATA_DIR="$(resolve_outputs_base_dir)/${JOB_DIR:-unknown}/prometheus"
+    mkdir -p "$PROMETHEUS_DATA_DIR"
+    local prom_log="$PROMETHEUS_DATA_DIR/prometheus.log"
+
+    # Per-job config under the job's prometheus dir avoids two concurrent jobs
+    # on the same host racing on /tmp/ray_prometheus.yml.
+    local prom_config="$PROMETHEUS_DATA_DIR/ray_prometheus.yml"
+    cat > "$prom_config" <<EOF
 global:
   scrape_interval: 5s
 scrape_configs:
@@ -92,24 +99,24 @@ scrape_configs:
       - targets: [${hw_targets}]
 EOF
 
-    PROMETHEUS_DATA_DIR="$(resolve_outputs_base_dir)/${JOB_DIR:-unknown}/prometheus"
-    mkdir -p "$PROMETHEUS_DATA_DIR"
-    local prom_log="$PROMETHEUS_DATA_DIR/prometheus.log"
-
     # Common flags (reused for port discovery and the watchdog launch).
     local -a prom_flags=(
-        --config.file=/tmp/ray_prometheus.yml
+        --config.file="$prom_config"
         --storage.tsdb.path="$PROMETHEUS_DATA_DIR"
         --storage.tsdb.retention.time=30d
     )
 
     # --- Probe for a usable port (launch briefly, check, kill) ---
+    # SECURITY: bind the Prometheus query API to 127.0.0.1 only.  Scraping
+    # of remote node exporters / Ray metrics still works because that's
+    # outbound (Prometheus initiates the HTTP GET); only the local query
+    # endpoint is locked down.  Tunnel via SSH-J per print_ray_info().
     local actual_port="$PROMETHEUS_PORT"
     local max_retries=5
     local prom_pid
     for ((attempt = 0; attempt <= max_retries; attempt++)); do
         "$prom_bin" "${prom_flags[@]}" \
-            --web.listen-address=":${actual_port}" >>"$prom_log" 2>&1 &
+            --web.listen-address="127.0.0.1:${actual_port}" >>"$prom_log" 2>&1 &
         prom_pid=$!
         sleep 2
         if kill -0 "$prom_pid" 2>/dev/null; then
@@ -140,7 +147,7 @@ EOF
     # stale TSDB lock file (safe — the old process is dead).
     _run_with_watchdog "Prometheus" "$prom_log" \
         --on-restart "rm -f '$PROMETHEUS_DATA_DIR/lock'" -- \
-        "$prom_bin" "${prom_flags[@]}" --web.listen-address=":${actual_port}"
+        "$prom_bin" "${prom_flags[@]}" --web.listen-address="127.0.0.1:${actual_port}"
 }
 
 # Start a read-only Prometheus against persisted TSDB data.
@@ -195,8 +202,10 @@ YAML
     echo "  ssh -L ${port}:localhost:${port} ${host_ip}"
     # exec replaces bash with prometheus — one fewer process, and killing the
     # PID targets prometheus directly instead of orphaning it as a child.
+    # SECURITY: 127.0.0.1 — the documented tunnel `ssh -L p:localhost:p host`
+    # already assumes localhost binding, this just enforces it.
     exec "$prom_bin" --config.file="$cfg" \
-        --web.listen-address=":${port}" \
+        --web.listen-address="127.0.0.1:${port}" \
         --storage.tsdb.path="$data_dir" \
         --storage.tsdb.retention.time=10y \
         --query.lookback-delta=15m

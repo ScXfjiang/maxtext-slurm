@@ -40,7 +40,7 @@ echo "MODEL_NAME=$MODEL_NAME"
 # Warn if the user accidentally passed sbatch flags
 if [[ ${#SBATCH_ARGS[@]} -gt 0 ]]; then
     echo "WARNING: Ignoring sbatch args (${SBATCH_ARGS[*]}) — not applicable." >&2
-    echo "         Did you mean to use submit.sh instead?" >&2
+    echo "         For Slurm submission use submit.sh; for Kubernetes use k8s_submit.sh." >&2
 fi
 
 # ============================================================================

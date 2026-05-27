@@ -2,7 +2,8 @@
 
 # job_dir.sh — Central definition for the per-job directory naming convention.
 #
-# Usage (sourced by submit.sh, run_local.sh, _container.sh, _train.sh, ray_cluster.sh):
+# Usage (sourced by submit.sh, k8s_submit.sh, _k8s_job.sh, run_setup.sh,
+# in_container_run.sh, _container.sh, _train.sh, utils/ray_cluster.sh):
 #   source utils/job_dir.sh
 #   JOB_DIR=$(make_job_dir "$JOB_ID" "$JOB_NAME")
 #   if is_checkpointing_enabled "$JOB_DIR"; then ...

@@ -4,12 +4,14 @@ Each `.gpu.yml` file in `configs/` defines a training run configuration. These f
 
 ## Available configs
 
-Only models with a `.gpu.yml` file in `configs/` are supported — there is no built-in model registry. List the available configs by browsing the directory or running a resolve with an invalid name:
+Only models with a `.gpu.yml` file in `configs/` are supported — there is no built-in model registry. List the available configs by browsing the directory or running a resolve with a deliberately invalid name:
 
 ```bash
 ls configs/*.gpu.yml
-submit.sh ? 2>&1  # prints all supported model names
+submit.sh __nonexistent_model__ 2>&1  # prints "Supported models: ..."
 ```
+
+(Avoid `?` — it's a shell glob and may unexpectedly match a single-character path.)
 
 Model-name configs contain `model_name: ...`; inline configs have the architecture parameters at the top (wrapped in `#===` banners) and `model_name` commented out.
 

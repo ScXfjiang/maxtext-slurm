@@ -3,8 +3,8 @@
 # check_ecc.sh
 #
 # Usage:
-#   ./check_ecc.sh 'chi[2742,2761,2770-2771]'
-#   ./check_ecc.sh                      # defaults to current host only
+#   ./check_ecc.sh '<nodelist>'        # e.g. 'node[1-4]' or 'host01,host02'
+#   ./check_ecc.sh                     # defaults to current host only
 #
 # Behavior:
 # - If user provides a nodelist: prints the parsed node list to stderr.

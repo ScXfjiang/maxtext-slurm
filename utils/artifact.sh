@@ -1,7 +1,7 @@
 #!/bin/bash
 # artifact.sh — Build a point-in-time artifact of the repository for batch jobs.
 #
-# Usage (sourced by submit.sh):
+# Usage (sourced by submit.sh and k8s_submit.sh):
 #   source utils/artifact.sh
 #   build_artifact <repo_root> <artifact_dir> <maxtext_slurm_dir>
 #

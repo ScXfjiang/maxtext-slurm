@@ -27,7 +27,12 @@ _TIMEOUT="${K8S_BARRIER_TIMEOUT:-120}"
 
 # -------- Derive rank from Indexed Job --------
 export NODE_RANK="${JOB_COMPLETION_INDEX:?JOB_COMPLETION_INDEX not set — is this an Indexed Job?}"
-HOST_IP=$(hostname -I | awk '{print $1}')
+# SECURITY: prefer the cluster-private RFC1918 IP over `hostname -I | awk
+# '{print $1}'`, which on dual-IP hosts often returns the public IP first.
+# A public-IP coordinator is itself an attack surface (cf. Ray GCS GCS
+# attack on 2026-05-03 — see utils/ray_cluster.sh start_ray_head).
+source "$SCRIPT_DIR/utils/detect_ip.sh"
+HOST_IP="$(detect_cluster_ip)"
 echo "[$NODE_RANK] Starting on $(hostname) ($HOST_IP)"
 
 # -------- Coordinator discovery via shared filesystem --------

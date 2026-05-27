@@ -28,6 +28,8 @@ profiler_steps: 1
 
 Trace files are written to `base_output_directory` (i.e. `OUTPUT_PATH`).
 
+**1-GPU-per-process mode.** The JAX xplane writer names output files by `socket.gethostname()` alone, so when multiple processes share a host (see [1-GPU-per-process mode](job-submission.md#1-gpu-per-process-mode)) they'd race on the same `<host>.xplane.pb`. `monkey_patch_maxtext.py` wraps `jax.profiler.stop_trace` with a host-scoped `flock` that serializes the write and tags each process's output as `<host>.proc<LOCAL_RANK>.xplane.pb` (with matching `.trace.json.gz` and `.SSTABLE`). Serialization makes successive writes from the same host land in different per-second timestamp directories, so one job ends up with `LOCAL_WORLD_SIZE` timestamp dirs of flat per-host files — `analyze_job.py` already treats multiple ts dirs as periodic-profiling windows and handles them transparently. Filenames still start with `<host>.`, so the node-0 filter, `merge_xplane_traces.py`, TraceLens, and IRLens keep working unchanged.
+
 ### HLO IR dump
 
 [XLA](https://openxla.org/)'s JIT compiler transforms JAX code into [HLO (High Level Operations)](https://openxla.org/xla/operation_semantics) IR before generating GPU kernels. HLO dumps capture the compiled computation graph — which collectives are fused, how loops are structured, and what kernels will execute each step — independent of actual execution timing.
@@ -49,7 +51,7 @@ This appends the following XLA flags (configured in `train_env.sh`):
 | `--xla_dump_hlo_pipeline_re` | Regex filter for compiler passes (`(?i)gpu` captures GPU-specific passes) |
 | `--xla_dump_to` | Output directory for dump files |
 
-Dump files are written to `<OUTPUT_PATH>/xla_dump/`. Key files:
+Dump files are written to `<OUTPUT_PATH>/xla_dump/`. The dump is scoped to global rank 0 only, because SPMD produces identical HLO on every rank and concurrent writers would race on filenames (each process has its own XLA module counter that aligns across ranks). Key files:
 
 | File | Contents |
 |------|----------|
@@ -64,7 +66,7 @@ Dump files are written to `<OUTPUT_PATH>/xla_dump/`. Key files:
 
 ### Visualize traces
 
-Open trace files in [Perfetto](https://ui.perfetto.dev/) (recommended for large files) or `chrome://tracing`. Multi-node jobs produce one trace file per node. Each can be viewed individually, or merged into one file for side-by-side viewing:
+Open trace files in [Perfetto](https://ui.perfetto.dev/) (recommended for large files) or `chrome://tracing`. Multi-node jobs produce one trace file per host by default, or `LOCAL_WORLD_SIZE` per host (one per local GPU, named `<host>.proc<N>.trace.json.gz`) in [1-GPU-per-process mode](job-submission.md#1-gpu-per-process-mode). Each can be viewed individually, or merged into one file for side-by-side viewing:
 
 ```bash
 utils/merge_xplane_traces.py "$JOB_WORKSPACE/<job>/"
@@ -191,10 +193,11 @@ The dispatcher is safe to re-run. It records `job_status` (completed / failed / 
 3. **Browse results** — start the dashboard to visualize, compare, and download analysis results:
 
 ```bash
-utils/perf_server.py                             # auto-picks port from 8080
-utils/perf_server.py --host 0.0.0.0              # remote access (auto port)
-utils/perf_server.py --host 0.0.0.0 --port 8080  # explicit port
+utils/perf_server.py                             # localhost only, auto-picks port from 8080
+utils/perf_server.py --port 8080                 # localhost only, explicit port
 ```
+
+The default bind is `127.0.0.1`. To reach the dashboard from a different machine, prefer `ssh -L 8080:localhost:8080 user@analysis-host` over `--host 0.0.0.0` — the dashboard has no auth and a wide bind exposes job metadata to the network.
 
 Requires `pip install fastapi uvicorn`. The dashboard reads `analysis.json` files written by `analyze_job.py`. When periodic profiling produced multiple TraceLens profiles, the dashboard shows only node 0's profiles (matching `analyze_job.py`'s selection) and offers a profile selector. The file browser filters external profile files to only show those belonging to the viewed job (using the same time-window + node-0 disambiguation).
 

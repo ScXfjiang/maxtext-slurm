@@ -128,14 +128,45 @@ TRAIN_ARGS=(
 # Unbuffered output for real-time log streaming
 export PYTHONUNBUFFERED=1
 
+# Normalize ONE_GPU_PER_PROCESS → "true"/"false" (empty = false). Reject other values.
+case "${ONE_GPU_PER_PROCESS:-false}" in
+    1|true)      ONE_GPU_PER_PROCESS=true  ;;
+    0|false|"")  ONE_GPU_PER_PROCESS=false ;;
+    *) echo "[ERROR] ONE_GPU_PER_PROCESS='${ONE_GPU_PER_PROCESS}' must be true/false." >&2; exit 1 ;;
+esac
+export ONE_GPU_PER_PROCESS
+
+# In 1-GPU-per-process mode, precompute LOCAL_WORLD_SIZE / NPROCS so both the
+# direct fan-out (below) and the Ray fan-out (_ray_actor.py) see them.
+if [[ "${ONE_GPU_PER_PROCESS}" == "true" ]]; then
+    export LOCAL_WORLD_SIZE="${LOCAL_WORLD_SIZE:-$(python3 -c "import hip; print(hip.hipGetDeviceCount()[1])" 2>/dev/null || echo 8)}"
+    export NPROCS=$(( NNODES * LOCAL_WORLD_SIZE ))
+fi
+
 if [[ "${USE_RAY:-false}" == "true" ]]; then
     # Ray Actor Mode: actor launches training in a subprocess (no GIL contention)
     # Enables: GPU monitoring, flame graphs via py-spy --subprocesses
     echo "Launching via Ray actor..."
     export RAY_DEDUP_LOGS=0
     python3 -u "$SCRIPT_DIR/_ray_actor.py" "${TRAIN_ARGS[@]}"
+elif [[ "${ONE_GPU_PER_PROCESS}" == "true" ]]; then
+    # Multi-process mode: 1 GPU per JAX process.
+    # Launches LOCAL_WORLD_SIZE processes, each assigned 1 GPU via JAX local_device_ids.
+    echo "Launching $LOCAL_WORLD_SIZE processes per node ($NPROCS total) for 1-GPU-per-process mode..."
+    PIDS=()
+    for (( i=0; i<LOCAL_WORLD_SIZE; i++ )); do
+        LOCAL_RANK=$i \
+        GLOBAL_RANK=$(( NODE_RANK * LOCAL_WORLD_SIZE + i )) \
+        python3 -u "$SCRIPT_DIR/utils/monkey_patch_maxtext.py" "${TRAIN_ARGS[@]}" &
+        PIDS+=($!)
+    done
+    _exit_code=0
+    for pid in "${PIDS[@]}"; do
+        wait "$pid" || { _rc=$?; [[ $_exit_code -eq 0 ]] && _exit_code=$_rc; }
+    done
+    exit "$_exit_code"
 else
     # Direct Mode (with MFU tracking)
     echo "Launching MaxText.train directly..."
-    python3 -u "$SCRIPT_DIR/utils/mfu_tracker.py" "${TRAIN_ARGS[@]}"
+    python3 -u "$SCRIPT_DIR/utils/monkey_patch_maxtext.py" "${TRAIN_ARGS[@]}"
 fi
