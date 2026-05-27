@@ -12,9 +12,9 @@ export RCCL_MSCCLPP_ENABLE=0   # overrides train_env.sh default of 1
 export NCCL_NSOCKS_PERTHREAD=1
 export NCCL_SOCKET_NTHREADS=1
 
-# Force XLA autotune level 4 (kernel measurement, not heuristics).
-# Image default is 0; level 4 typically unlocks substantial GEMM-selection gains.
-export XLA_FLAGS="${XLA_FLAGS:+$XLA_FLAGS }--xla_gpu_autotune_level=4 \
+# XLA autotune disabled (level 0 = heuristic kernel selection, no measurement).
+# Trade-off: faster compile (saves ~10-15 min) but ~20% lower throughput vs level 4.
+export XLA_FLAGS="${XLA_FLAGS:+$XLA_FLAGS }--xla_gpu_autotune_level=0 \
     --xla_gpu_memory_limit_slop_factor=95 \
     --xla_gpu_enable_triton_gemm=false \
     --xla_gpu_enable_cublaslt=true \

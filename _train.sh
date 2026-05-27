@@ -143,12 +143,52 @@ if [[ "${ONE_GPU_PER_PROCESS}" == "true" ]]; then
     export NPROCS=$(( NNODES * LOCAL_WORLD_SIZE ))
 fi
 
+# ---- Optional: wrap Python launch with rocprofv3 ---------------------------
+# Enable via `_env_ROCPROF_TRACE=1` CLI passthrough. Optional tuning:
+#   _env_ROCPROF_OUTDIR=<path>   (default: $OUTPUT_PATH/rocprof)
+#   _env_ROCPROF_DELAY=<sec>     (default: 0  = start at t=0)
+#   _env_ROCPROF_DURATION=<sec>  (default: 0  = profile whole run)
+#   _env_ROCPROF_TRACES=<csv>    (default: kernel,hip,rccl,marker)
+# Per-node, per-rank traces written to $ROCPROF_OUTDIR/<host>/<SLURM_PROCID>/.
+# Not supported when ONE_GPU_PER_PROCESS=true (per-rank output collision).
+PROF_CMD=()
+if [[ "${ROCPROF_TRACE:-0}" == "1" ]]; then
+    if [[ "${ONE_GPU_PER_PROCESS}" == "true" ]]; then
+        echo "[rocprofv3] ERROR: ROCPROF_TRACE=1 is not supported with ONE_GPU_PER_PROCESS=true" >&2
+        exit 1
+    fi
+    ROCPROF_OUTDIR="${ROCPROF_OUTDIR:-$OUTPUT_PATH/rocprof}"
+    ROCPROF_DELAY="${ROCPROF_DELAY:-0}"
+    ROCPROF_DURATION="${ROCPROF_DURATION:-0}"
+    ROCPROF_TRACES="${ROCPROF_TRACES:-kernel,hip,rccl,marker}"
+    mkdir -p -v "$ROCPROF_OUTDIR"
+    chmod a+w "$ROCPROF_OUTDIR" 2>/dev/null || true
+    PROF_CMD=(rocprofv3
+        --output-format pftrace csv
+        --output-directory "${ROCPROF_OUTDIR}/%hostname%/%env{SLURM_PROCID}%"
+    )
+    if [[ "$ROCPROF_DELAY" != "0" || "$ROCPROF_DURATION" != "0" ]]; then
+        PROF_CMD+=(--collection-period "${ROCPROF_DELAY}:${ROCPROF_DURATION}:1")
+    fi
+    IFS=',' read -ra _TRACE_KINDS <<< "$ROCPROF_TRACES"
+    for kind in "${_TRACE_KINDS[@]}"; do
+        PROF_CMD+=("--${kind}-trace")
+    done
+    unset _TRACE_KINDS
+    PROF_CMD+=(--)
+    echo "[rocprofv3] wrapping python launch"
+    echo "[rocprofv3]   outdir    = $ROCPROF_OUTDIR"
+    echo "[rocprofv3]   delay     = ${ROCPROF_DELAY}s"
+    echo "[rocprofv3]   duration  = ${ROCPROF_DURATION}s (0 = profile whole run)"
+    echo "[rocprofv3]   traces    = $ROCPROF_TRACES"
+fi
+
 if [[ "${USE_RAY:-false}" == "true" ]]; then
     # Ray Actor Mode: actor launches training in a subprocess (no GIL contention)
     # Enables: GPU monitoring, flame graphs via py-spy --subprocesses
     echo "Launching via Ray actor..."
     export RAY_DEDUP_LOGS=0
-    python3 -u "$SCRIPT_DIR/_ray_actor.py" "${TRAIN_ARGS[@]}"
+    "${PROF_CMD[@]}" python3 -u "$SCRIPT_DIR/_ray_actor.py" "${TRAIN_ARGS[@]}"
 elif [[ "${ONE_GPU_PER_PROCESS}" == "true" ]]; then
     # Multi-process mode: 1 GPU per JAX process.
     # Launches LOCAL_WORLD_SIZE processes, each assigned 1 GPU via JAX local_device_ids.
@@ -168,5 +208,5 @@ elif [[ "${ONE_GPU_PER_PROCESS}" == "true" ]]; then
 else
     # Direct Mode (with MFU tracking)
     echo "Launching MaxText.train directly..."
-    python3 -u "$SCRIPT_DIR/utils/monkey_patch_maxtext.py" "${TRAIN_ARGS[@]}"
+    "${PROF_CMD[@]}" python3 -u "$SCRIPT_DIR/utils/monkey_patch_maxtext.py" "${TRAIN_ARGS[@]}"
 fi
