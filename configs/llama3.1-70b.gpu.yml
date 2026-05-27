@@ -1,0 +1,71 @@
+# ── Run Config ───────────────────────────────────────────────────────────────
+# Llama-3.1 70B FP8 multi-node config (4 x 8 = 32 GPUs).
+# Single FSDP group across all ranks (matches TorchTitan fully_shard default).
+base_config: "base.yml"
+run_name: "llama3_1_70B_training"
+hardware: "gpu"
+model_name: "llama3.1-70b"
+
+# ── Training ─────────────────────────────────────────────────────────────────
+steps: 50
+
+# ── Parallelism ──────────────────────────────────────────────────────────────
+# Hierarchical (DP+FSDP) sharding can trigger multi-NCCL-communicator
+# bootstrap issues; flat FSDP initializes only one communicator and avoids it.
+dcn_data_parallelism: 1
+dcn_fsdp_parallelism: -1
+dcn_sequence_parallelism: 1
+dcn_context_parallelism: 1
+dcn_tensor_parallelism: 1
+dcn_pipeline_parallelism: 1
+dcn_expert_parallelism: 1
+ici_data_parallelism: 1
+ici_fsdp_parallelism: -1
+ici_sequence_parallelism: 1
+ici_context_parallelism: 1
+ici_tensor_parallelism: 1
+ici_pipeline_parallelism: 1
+ici_expert_parallelism: 1
+
+# ── Batch & Sequence ─────────────────────────────────────────────────────────
+# per_device_batch_size=6 x 32 devices (4 nodes x 8 GPU) = global 192
+# matches PyTorch --training.local_batch_size 6 --training.global_batch_size 192
+per_device_batch_size: 6
+max_target_length: 8192
+packing: true
+max_segments_per_seq: 32
+
+# ── Attention & Compute ──────────────────────────────────────────────────────
+attention: "cudnn_flash_te"
+remat_policy: "full"
+use_iota_embed: True
+scan_layers: True
+logits_dot_in_fp32: False
+megablox: False
+optimizer_memory_host_offload: False
+param_scan_axis: 1
+shardy: False
+
+# ── Dtypes & Quantization ────────────────────────────────────────────────────
+# FP8 matches PyTorch/Primus `quantize.linear.float8` converter.
+dtype: "bfloat16"
+weight_dtype: bfloat16
+quantization: "fp8"
+quantize_kvcache: False
+kv_quant_axis: "heads_and_dkv"
+kv_quant_dtype: "int8"
+checkpoint_is_quantized: False
+
+# ── Profiler ─────────────────────────────────────────────────────────────────
+profiler: "" #"xplane"
+skip_first_n_steps_for_profiler: 3
+profiler_steps: 1
+
+# ── Checkpointing ────────────────────────────────────────────────────────────
+enable_checkpointing: False
+async_checkpointing: False
+
+# ── Dataset ──────────────────────────────────────────────────────────────────
+# synthetic matches PyTorch --training.mock_data True
+dataset_type: "synthetic"
+tokenizer_path: "meta-llama/Llama-3.3-70B-Instruct"

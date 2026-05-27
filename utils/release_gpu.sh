@@ -43,7 +43,27 @@ _get_gpu_pids() {
     if command -v nvidia-smi &>/dev/null; then
         pids+=" $(nvidia-smi --query-compute-apps=pid --format=csv,noheader 2>/dev/null | tr -d ' ')"
     fi
-    echo "$pids" | xargs
+    # Filter out system/scheduler PIDs that show up in rocm-smi but are NOT
+    # stale training processes:
+    #   - slurmstepd  : this srun's own scheduler stub (has cgroup attachment to
+    #                   /dev/kfd, so rocm-smi reports it; VRAM USED = 0).
+    #                   Killing it tears down the running srun task and leaves
+    #                   the parent sbatch hung waiting for srun.
+    #   - gpuagent    : AMD GPU agent system daemon, holds device handles but
+    #                   no training memory.
+    # Both are root-owned; with passwordless sudo, the kill loop below would
+    # actually succeed and kill the running task, so we must filter here.
+    local filtered=""
+    for pid in $pids; do
+        [[ -z "$pid" ]] && continue
+        local comm
+        comm=$(ps -p "$pid" -o comm= 2>/dev/null | tr -d ' ')
+        case "$comm" in
+            slurmstepd|gpuagent) continue ;;
+            *) filtered+=" $pid" ;;
+        esac
+    done
+    echo "$filtered" | xargs
 }
 
 _is_zombie() {

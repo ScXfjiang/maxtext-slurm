@@ -1,0 +1,65 @@
+# ── Run Config ───────────────────────────────────────────────────────────────
+# Llama-3.1 8B — 1-node smoke-test config.
+# Designed for a single MI355X node (8 GPUs, 288 GB HBM each).
+# Uses FSDP across the 8 intra-node GPUs, bf16 (no FP8), synthetic data.
+base_config: "base.yml"
+run_name: "llama3_1_8B_train_test"
+hardware: "gpu"
+model_name: "llama3.1-8b"
+
+# ── Training ─────────────────────────────────────────────────────────────────
+steps: 30
+
+# ── Parallelism ──────────────────────────────────────────────────────────────
+# 1 node only: DCN axes all collapse to 1 (data=-1 resolves to 1 here).
+# Intra-node: full FSDP across 8 GPUs.
+dcn_data_parallelism: -1 # auto-sharded
+dcn_fsdp_parallelism: 1
+dcn_sequence_parallelism: 1 # never recommended
+dcn_context_parallelism: 1
+dcn_tensor_parallelism: 1 # never recommended
+dcn_pipeline_parallelism: 1
+dcn_expert_parallelism: 1
+ici_data_parallelism: 1
+ici_fsdp_parallelism: 8
+ici_sequence_parallelism: 1
+ici_context_parallelism: 1
+ici_tensor_parallelism: 1
+ici_pipeline_parallelism: 1
+ici_expert_parallelism: 1
+
+# ── Batch & Sequence ─────────────────────────────────────────────────────────
+# Conservative smoke-test sizing. Skill table suggests 32-64 for <20B on MI355X,
+# but starting lower keeps compile fast and leaves headroom; bump later if
+# desired via CLI: -- per_device_batch_size=32
+per_device_batch_size: 8
+max_target_length: 4096
+packing: true
+max_segments_per_seq: 32
+
+# ── Attention & Compute ──────────────────────────────────────────────────────
+# Small-model defaults per skills/model-config-guide/SKILL.md compute table.
+attention: "cudnn_flash_te"
+remat_policy: "minimal_flash"
+use_iota_embed: True
+scan_layers: False
+logits_dot_in_fp32: False
+shardy: false
+
+# ── Dtypes & Quantization ────────────────────────────────────────────────────
+# Pure bf16 — FP8 intentionally disabled for this smoke test.
+dtype: "bfloat16"
+weight_dtype: "bfloat16"
+
+# ── Profiler ─────────────────────────────────────────────────────────────────
+profiler: "" #"xplane"
+upload_all_profiler_results: true
+skip_first_n_steps_for_profiler: 3
+profiler_steps: 1
+
+# ── Checkpointing ────────────────────────────────────────────────────────────
+enable_checkpointing: False
+async_checkpointing: False
+
+# ── Dataset ──────────────────────────────────────────────────────────────────
+dataset_type: "synthetic"
