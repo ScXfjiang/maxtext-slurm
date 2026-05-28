@@ -181,9 +181,18 @@ if [[ "${ROCPROF_TRACE:-0}" == "1" ]]; then
     ROCPROF_TRACES="${ROCPROF_TRACES:-kernel,hip,rccl,marker}"
     mkdir -p -v "$ROCPROF_OUTDIR"
     chmod a+w "$ROCPROF_OUTDIR" 2>/dev/null || true
+    # NOTE: output dir uses `%hostname%/%pid%` so each rocprofv3 instance (parent
+    # python + any sh subprocesses for ldconfig etc.) writes to its own subdir.
+    # Without this isolation, a short-lived subprocess's Perfetto session
+    # finalize closes the shared session, leaving the parent unable to write
+    # its `<pid>_results.pftrace` even though CSVs flush via atexit.
+    # Bonus: `%env{SLURM_PROCID}%` actually doesn't expand in rocprofv3 v1
+    # (silently falls back to hostname), so the previous pattern produced
+    # `<host>/<host>/<pid>_*` (host nested under host) which caused this exact
+    # collision.  Native `%pid%` is reliable.
     PROF_CMD=(rocprofv3
         --output-format pftrace csv
-        --output-directory "${ROCPROF_OUTDIR}/%hostname%/%env{SLURM_PROCID}%"
+        --output-directory "${ROCPROF_OUTDIR}/%hostname%/%pid%"
     )
     _eff_duration="$ROCPROF_DURATION"
     [[ "$_eff_duration" == "0" ]] && _eff_duration=999999
