@@ -152,21 +152,29 @@ fi
 # Per-node, per-rank traces at $ROCPROF_OUTDIR/<host>/<SLURM_PROCID>/.
 # Not supported when ONE_GPU_PER_PROCESS=true (per-rank output collision).
 #
-# CRITICAL: rocprofv3 v1.0.0 in rocm/jax-training:maxtext-v26.2 has TWO known quirks:
+# CRITICAL constraints for rocprofv3 v1.0.0 in rocm/jax-training:maxtext-v26.2:
 #   1. Without `--collection-period`, only HIP compiler-side events are captured
-#      (no kernel_trace.csv / rccl_api_trace.csv / marker_api_trace.csv). The
-#      wrapper ALWAYS passes `--collection-period` to dodge this code path.
-#   2. `--sys-trace` (catch-all) and `--stats --summary` SUPPRESS per-domain trace
-#      CSV output — so we use explicit per-domain `--<X>-trace` flags instead.
-# Empirically validated by comparing job 13526 (working: per-domain + period)
-# vs 14863 (broken: --sys-trace + --stats + period): only the former produced
-# kernel_trace.csv / rccl_api_trace.csv / marker_api_trace.csv.
+#      (no kernel/rccl/marker CSV). The wrapper ALWAYS passes `--collection-period`.
+#   2. `--sys-trace` and `--stats --summary` SUPPRESS per-domain trace CSV output.
+#      Use explicit per-domain `--<X>-trace` flags instead.
+#   3. monkey_patch_maxtext.py's MAXTEXT_FAST_EXIT defaults to 1, calling
+#      `os._exit()` which BYPASSES rocprofv3's atexit/destructor finalize handler
+#      — trace buffers in memory are lost. We force MAXTEXT_FAST_EXIT=0 below
+#      so trace files actually get written. The fast-exit was added by commit
+#      3e2d7e5 (May 9, "Fix end-of-training teardown") to skip JAX
+#      pending_event_logger's 5-15 min stall on MoE; rocprofv3 finalize was
+#      collateral damage. Job 13526 (May 11, branch pre-3e2d7e5, no fast-exit)
+#      wrote a 19MB kernel CSV; jobs 14882/14883 (May 28, post-merge, fast-exit
+#      ON) wrote 0 bytes of training trace.
 PROF_CMD=()
 if [[ "${ROCPROF_TRACE:-0}" == "1" ]]; then
     if [[ "${ONE_GPU_PER_PROCESS}" == "true" ]]; then
         echo "[rocprofv3] ERROR: ROCPROF_TRACE=1 is not supported with ONE_GPU_PER_PROCESS=true" >&2
         exit 1
     fi
+    # Force normal Python shutdown so rocprofv3's atexit-driven finalize runs.
+    export MAXTEXT_FAST_EXIT=0
+    echo "[rocprofv3] forcing MAXTEXT_FAST_EXIT=0 so atexit/destructor handlers fire"
     ROCPROF_OUTDIR="${ROCPROF_OUTDIR:-$OUTPUT_PATH/rocprof}"
     ROCPROF_DELAY="${ROCPROF_DELAY:-0}"
     ROCPROF_DURATION="${ROCPROF_DURATION:-0}"
