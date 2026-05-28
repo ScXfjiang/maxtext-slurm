@@ -147,15 +147,20 @@ fi
 # Enable via `_env_ROCPROF_TRACE=1` CLI passthrough. Optional tuning:
 #   _env_ROCPROF_OUTDIR=<path>     (default: $OUTPUT_PATH/rocprof)
 #   _env_ROCPROF_DELAY=<sec>       (default: 0   = start at t=0)
-#   _env_ROCPROF_DURATION=<sec>    (default: 0   = profile whole run)
-#   _env_ROCPROF_TRACES=<spec>     (default: sys = `--sys-trace`)
-#       * `sys`     -> --sys-trace (HIP + HSA + kernel + RCCL + marker + mem copy/alloc/scratch). Most complete.
-#       * `runtime` -> --runtime-trace (HIP runtime + marker + kernel + mem ops; no HSA / no HIP compiler).
-#       * comma-list e.g. `kernel,hip,rccl,marker` -> per-domain `--<domain>-trace` flags (legacy).
-#   _env_ROCPROF_STATS=<0|1>       (default: 1 = add `--stats --summary` for post-run summary CSVs).
-#   _env_ROCPROF_RENAME_KERNELS=<0|1> (default: 1 = add `--kernel-rename` so ROCTx ranges replace mangled names).
-# Per-node, per-rank traces written to $ROCPROF_OUTDIR/<host>/<SLURM_PROCID>/.
+#   _env_ROCPROF_DURATION=<sec>    (default: 0   = treated as "whole run", expanded to 999999s)
+#   _env_ROCPROF_TRACES=<csv>      (default: kernel,hip,rccl,marker -> --<X>-trace each)
+# Per-node, per-rank traces at $ROCPROF_OUTDIR/<host>/<SLURM_PROCID>/.
 # Not supported when ONE_GPU_PER_PROCESS=true (per-rank output collision).
+#
+# CRITICAL: rocprofv3 v1.0.0 in rocm/jax-training:maxtext-v26.2 has TWO known quirks:
+#   1. Without `--collection-period`, only HIP compiler-side events are captured
+#      (no kernel_trace.csv / rccl_api_trace.csv / marker_api_trace.csv). The
+#      wrapper ALWAYS passes `--collection-period` to dodge this code path.
+#   2. `--sys-trace` (catch-all) and `--stats --summary` SUPPRESS per-domain trace
+#      CSV output — so we use explicit per-domain `--<X>-trace` flags instead.
+# Empirically validated by comparing job 13526 (working: per-domain + period)
+# vs 14863 (broken: --sys-trace + --stats + period): only the former produced
+# kernel_trace.csv / rccl_api_trace.csv / marker_api_trace.csv.
 PROF_CMD=()
 if [[ "${ROCPROF_TRACE:-0}" == "1" ]]; then
     if [[ "${ONE_GPU_PER_PROCESS}" == "true" ]]; then
@@ -165,52 +170,29 @@ if [[ "${ROCPROF_TRACE:-0}" == "1" ]]; then
     ROCPROF_OUTDIR="${ROCPROF_OUTDIR:-$OUTPUT_PATH/rocprof}"
     ROCPROF_DELAY="${ROCPROF_DELAY:-0}"
     ROCPROF_DURATION="${ROCPROF_DURATION:-0}"
-    ROCPROF_TRACES="${ROCPROF_TRACES:-sys}"
-    ROCPROF_STATS="${ROCPROF_STATS:-1}"
-    ROCPROF_RENAME_KERNELS="${ROCPROF_RENAME_KERNELS:-1}"
+    ROCPROF_TRACES="${ROCPROF_TRACES:-kernel,hip,rccl,marker}"
     mkdir -p -v "$ROCPROF_OUTDIR"
     chmod a+w "$ROCPROF_OUTDIR" 2>/dev/null || true
     PROF_CMD=(rocprofv3
         --output-format pftrace csv
         --output-directory "${ROCPROF_OUTDIR}/%hostname%/%env{SLURM_PROCID}%"
     )
-    # CRITICAL: rocprofv3 in rocm/jax-training:maxtext-v26.2 silently drops per-domain
-    # trace files (kernel_trace.csv, rccl_api_trace.csv, marker_api_trace.csv) when
-    # `--collection-period` is omitted — only `hip_api_trace.csv` (compiler-side only) is
-    # produced. Always pass it. ROCPROF_DURATION=0 is treated as "profile whole run"
-    # via a very large duration window.
     _eff_duration="$ROCPROF_DURATION"
     [[ "$_eff_duration" == "0" ]] && _eff_duration=999999
     PROF_CMD+=(--collection-period "${ROCPROF_DELAY}:${_eff_duration}:1")
     unset _eff_duration
-    case "$ROCPROF_TRACES" in
-        sys)     PROF_CMD+=(--sys-trace) ;;
-        runtime) PROF_CMD+=(--runtime-trace) ;;
-        *)
-            # Per-domain comma list (legacy). NOTE: in some rocprofv3 builds, only --hip-trace
-            # produces output here; prefer `sys` or `runtime` for reliable kernel/RCCL traces.
-            IFS=',' read -ra _TRACE_KINDS <<< "$ROCPROF_TRACES"
-            for kind in "${_TRACE_KINDS[@]}"; do
-                PROF_CMD+=("--${kind}-trace")
-            done
-            unset _TRACE_KINDS
-            ;;
-    esac
-    if [[ "$ROCPROF_STATS" == "1" ]]; then
-        PROF_CMD+=(--stats --summary --summary-per-domain)
-    fi
-    if [[ "$ROCPROF_RENAME_KERNELS" == "1" ]]; then
-        PROF_CMD+=(--kernel-rename)
-    fi
+    IFS=',' read -ra _TRACE_KINDS <<< "$ROCPROF_TRACES"
+    for kind in "${_TRACE_KINDS[@]}"; do
+        PROF_CMD+=("--${kind}-trace")
+    done
+    unset _TRACE_KINDS
     PROF_CMD+=(--)
     echo "[rocprofv3] wrapping python launch"
-    echo "[rocprofv3]   outdir         = $ROCPROF_OUTDIR"
-    echo "[rocprofv3]   delay          = ${ROCPROF_DELAY}s"
-    echo "[rocprofv3]   duration       = ${ROCPROF_DURATION}s (0 = profile whole run)"
-    echo "[rocprofv3]   traces         = $ROCPROF_TRACES"
-    echo "[rocprofv3]   stats/summary  = $ROCPROF_STATS"
-    echo "[rocprofv3]   kernel-rename  = $ROCPROF_RENAME_KERNELS"
-    echo "[rocprofv3]   full cmd       = ${PROF_CMD[*]}"
+    echo "[rocprofv3]   outdir    = $ROCPROF_OUTDIR"
+    echo "[rocprofv3]   delay     = ${ROCPROF_DELAY}s"
+    echo "[rocprofv3]   duration  = ${ROCPROF_DURATION}s (0 = whole run)"
+    echo "[rocprofv3]   traces    = $ROCPROF_TRACES"
+    echo "[rocprofv3]   full cmd  = ${PROF_CMD[*]}"
 fi
 
 if [[ "${USE_RAY:-false}" == "true" ]]; then
